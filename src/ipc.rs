@@ -54,6 +54,11 @@ pub struct StatusBlock {
     pub reverse: u8,
     pub per_led: u8,
     pub zones: u8,
+    /// Active mode: 0 sync, 1 static, 2 effect, 3 rhythm.
+    pub mode: u8,
+    /// Last sound level sent for "Computer Rhythm", 0..=100.
+    pub audio_level: u8,
+    pub _pad: [u8; 2],
     pub horizontal: u16,
     pub vertical: u16,
     pub led_count: u16,

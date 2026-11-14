@@ -16,8 +16,18 @@ pub const PID: u16 = 0xFE07;
 
 const ACT_SYNC_SCREEN: u8 = 128;
 const ACT_READ_DEVICE_INFO: u8 = 130;
+const ACT_SET_LED_EFFECT: u8 = 133;
+const ACT_SET_SECTION_LED: u8 = 134;
+const ACT_SET_BRIGHTNESS: u8 = 135;
+const ACT_SET_DYNAMIC_SPEED: u8 = 138;
+const ACT_SET_SOUND_SENSITIVITY: u8 = 139;
 const ACT_SET_OPEN_URL: u8 = 147;
 const ACT_TURN_OFF_LIGHT: u8 = 151;
+const ACT_COMPUTER_RHYTHM: u8 = 152;
+
+/// Effect groups in `setLedEffect(type, index)`.
+pub const EFFECT_DYNAMIC: u8 = 2;
+pub const EFFECT_RHYTHM: u8 = 3;
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -124,6 +134,38 @@ impl Device {
     /// strip from opening its download page through its built-in keyboard interface.
     pub fn disable_open_url(&mut self) -> Result<()> {
         self.command(ACT_SET_OPEN_URL, &[0]).map(|_| ())
+    }
+
+    /// Solid colour runs: segments [first_led, r, g, b, last_led] (SyncLight "static colour").
+    pub fn set_section_led(&mut self, segments: &[[u8; 5]]) -> Result<()> {
+        let payload: Vec<u8> = segments.iter().flatten().copied().collect();
+        self.command(ACT_SET_SECTION_LED, &payload).map(|_| ())
+    }
+
+    /// Built-in firmware effect: `group` is EFFECT_DYNAMIC or EFFECT_RHYTHM, `index` 0..7.
+    pub fn set_led_effect(&mut self, group: u8, index: u8) -> Result<()> {
+        self.command(ACT_SET_LED_EFFECT, &[group, index]).map(|_| ())
+    }
+
+    /// Strip brightness, 5..=255.
+    pub fn set_brightness(&mut self, value: u8) -> Result<()> {
+        self.command(ACT_SET_BRIGHTNESS, &[value]).map(|_| ())
+    }
+
+    /// Effect speed as the firmware wants it: 0 = fastest, 100 = slowest.
+    pub fn set_dynamic_speed(&mut self, value: u8) -> Result<()> {
+        self.command(ACT_SET_DYNAMIC_SPEED, &[value]).map(|_| ())
+    }
+
+    /// Microphone sensitivity of the strip, 0..=100.
+    pub fn set_sound_sensitivity(&mut self, value: u8) -> Result<()> {
+        self.command(ACT_SET_SOUND_SENSITIVITY, &[value]).map(|_| ())
+    }
+
+    /// One step of "Computer Rhythm": rhythm effect `index` at sound `level` 0..=100
+    /// (firmware >= 1.8.2; SyncLight sends it every 40 ms).
+    pub fn computer_rhythm(&mut self, index: u8, level: u8) -> Result<()> {
+        self.command(ACT_COMPUTER_RHYTHM, &[index, level]).map(|_| ())
     }
 
     /// Firmware >= 1.8.0: dedicated "lights off" command.

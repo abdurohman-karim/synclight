@@ -1,6 +1,6 @@
 [package]
 name = "synclight-rs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Lightweight screen-sync (ambilight) driver for Robobloq SyncLight LED strips"
 
@@ -36,6 +36,11 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",

@@ -15,8 +15,11 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 
 use crate::capture::{Capturer, Grab};
-use crate::color::Pipeline;
-use crate::config::Settings;
+use crate::audio::PeakMeter;
+use crate::color::{self, Pipeline};
+use crate::config::{Mode, RhythmSource, Settings};
+use crate::device;
+use crate::sender::Cmd;
 use crate::device::{Device, DeviceInfo};
 use crate::layout::{self, Edge, Layout, LayoutConfig, PixRect};
 use crate::ipc::{self, StatusBlock, StatusWriter};
@@ -63,6 +66,8 @@ pub struct Status {
     /// Frames replaced by newer ones before the strip took them.
     pub replaced: u32,
     pub preview: Vec<[u8; 3]>,
+    /// What runs in a non-screen mode ("цвет #FF0000", "эффект №3"...); None in screen sync.
+    pub mode_label: Option<String>,
     /// Incremented on every update.
     pub seq: u64,
 }
@@ -86,6 +91,7 @@ impl Status {
             hid_max_ms: 0.0,
             replaced: 0,
             preview: Vec::new(),
+            mode_label: None,
             seq: 0,
         }
     }
@@ -95,7 +101,10 @@ impl Status {
         match &self.state {
             State::Starting => "Запуск...".into(),
             State::Off => "Синхронизация выключена".into(),
-            State::Running => format!("Работает: {:.0} кадров экрана/с, {:.0} отправок/с", self.fps, self.sends),
+            State::Running => match &self.mode_label {
+                Some(m) => format!("Работает: {m}"),
+                None => format!("Работает: {:.0} кадров экрана/с, {:.0} отправок/с", self.fps, self.sends),
+            },
             State::NoDevice => "Лента не подключена".into(),
             State::NoCapture(e) => format!("Нет захвата экрана: {e}"),
             State::PausedForSyncLight => "Пауза: запущен SyncLight".into(),
@@ -154,6 +163,24 @@ pub struct Options {
     pub yield_to_synclight: bool,
     /// Publish live status (LED colours, stats) for the settings window.
     pub publish_status: bool,
+}
+
+fn mode_code(m: Mode) -> u8 {
+    match m {
+        Mode::Sync => 0,
+        Mode::Static => 1,
+        Mode::Effect => 2,
+        Mode::Rhythm => 3,
+    }
+}
+
+/// What has been sent to the strip for a non-screen mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Applied {
+    Static([u8; 3], [usize; 3]),
+    Effect(u8),
+    RhythmDevice(u8),
+    RhythmComputer(u8),
 }
 
 fn state_code(s: &State) -> u8 {
@@ -277,6 +304,12 @@ struct Engine {
     /// Per LED: colour as it should look, for the settings window preview.
     preview: Vec<[u8; 3]>,
     ipc: Option<StatusWriter>,
+    /// Non-screen mode last sent to the strip, and its speed/sensitivity value.
+    mode_sent: Option<Applied>,
+    param_sent: Option<u8>,
+    brightness_sent: Option<u8>,
+    meter: Option<PeakMeter>,
+    audio_level: u8,
     have_frame: bool,
     idle: bool,
     lights_on: bool,
@@ -303,6 +336,11 @@ pub fn run(shared: Arc<Shared>, opts: Options) {
         shared,
         opts,
         ipc,
+        mode_sent: None,
+        param_sent: None,
+        brightness_sent: None,
+        meter: None,
+        audio_level: 0,
         preview: Vec::new(),
         out: None,
         info: None,
@@ -342,6 +380,8 @@ fn pipeline(s: &Settings) -> Pipeline {
 impl Engine {
     fn run(&mut self) {
         logger::info("движок запущен");
+        let mode = mode_code(self.settings.mode);
+        self.publish(|b| b.mode = mode);
         while !self.shared.stopping() {
             self.reload_settings();
 
@@ -357,7 +397,19 @@ impl Engine {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            if !self.ensure_device() || !self.ensure_capture() || !self.ensure_layout() {
+            if !self.ensure_device() {
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            self.apply_brightness();
+            if self.settings.mode != Mode::Sync {
+                self.mode_tick();
+                continue;
+            }
+            if self.mode_sent.take().is_some() {
+                self.param_sent = None; // back from another mode: frames take over the strip
+            }
+            if !self.ensure_capture() || !self.ensure_layout() {
                 std::thread::sleep(Duration::from_millis(250));
                 continue;
             }
@@ -365,6 +417,131 @@ impl Engine {
         }
         self.lights_off();
         logger::info("движок остановлен");
+    }
+
+    /// Strip (hardware) brightness: sent on connect and whenever the setting changes.
+    fn apply_brightness(&mut self) {
+        let raw = self.settings.strip_brightness_raw();
+        if let Some(o) = self.out.as_ref() {
+            if self.brightness_sent != Some(raw) {
+                o.command(Cmd::Brightness(raw));
+                self.brightness_sent = Some(raw);
+            }
+        }
+    }
+
+    /// Static colour, firmware effects and rhythm: one command when something changes,
+    /// plus a sound level 25 times per second for "Computer Rhythm".
+    fn mode_tick(&mut self) {
+        if let Some(err) = self.out.as_ref().and_then(|o| o.take_error()) {
+            self.release_device(&err);
+            return;
+        }
+        if self.cap.take().is_some() {
+            // Screen capture is not needed in these modes: release the GPU duplication.
+            self.have_frame = false;
+            self.last_sent.clear();
+        }
+        let s = self.settings.clone();
+        let want = match (s.mode, s.rhythm_source) {
+            (Mode::Static, _) => Applied::Static(s.color, self.pipe.wire),
+            (Mode::Effect, _) => Applied::Effect(s.effect),
+            (Mode::Rhythm, RhythmSource::Device) => Applied::RhythmDevice(s.rhythm),
+            (Mode::Rhythm, RhythmSource::Computer) => Applied::RhythmComputer(s.rhythm),
+            (Mode::Sync, _) => return,
+        };
+        let param = match want {
+            Applied::Effect(_) => Some(100 - s.effect_speed.min(100)),
+            Applied::RhythmDevice(_) => Some(s.rhythm_sensitivity),
+            _ => None,
+        };
+
+        if self.mode_sent != Some(want) {
+            self.apply_mode(want, param);
+            self.mode_sent = Some(want);
+            self.param_sent = param;
+            self.lights_on = !self.opts.dry_run;
+        } else if self.param_sent != param {
+            if let (Some(o), Some(p)) = (self.out.as_ref(), param) {
+                o.command(match want {
+                    Applied::Effect(_) => Cmd::DynamicSpeed(p),
+                    _ => Cmd::SoundSensitivity(p),
+                });
+            }
+            self.param_sent = param;
+        }
+
+        if let Applied::RhythmComputer(index) = want {
+            let meter = self.meter.get_or_insert_with(PeakMeter::new);
+            let peak = meter.peak().unwrap_or(0.0);
+            // 50 = exactly what SyncLight sends; higher reacts to quieter sound.
+            let v = peak * (s.rhythm_sensitivity.max(1) as f32 / 50.0);
+            let level = if v <= 0.01 { 0 } else { (v * 100.0).min(100.0) as u8 };
+            if let Some(o) = self.out.as_ref() {
+                o.rhythm(index, level);
+            }
+            self.audio_level = level;
+            self.publish(|b| b.audio_level = level);
+        } else {
+            self.meter = None;
+        }
+        self.set_state(State::Running);
+        let pause = if matches!(want, Applied::RhythmComputer(_)) { 40 } else { 100 };
+        std::thread::sleep(Duration::from_millis(pause));
+    }
+
+    fn apply_mode(&mut self, want: Applied, param: Option<u8>) {
+        let lamps = self.info.as_ref().map(|i| i.lamps as usize).filter(|&n| n > 0).unwrap_or(65).min(254);
+        let mut preview = [[0u8; 3]; ipc::MAX_LEDS];
+        let label: String;
+        let cmds: Vec<Cmd> = match want {
+            Applied::Static(c, wire) => {
+                // Same as SyncLight: one run over all LEDs, the rest of the 254 addresses off.
+                let s = color::limit_power([c[wire[0]], c[wire[1]], c[wire[2]]]);
+                let mut segs = vec![[1, s[0], s[1], s[2], lamps as u8]];
+                if lamps < 254 {
+                    segs.push([lamps as u8 + 1, 0, 0, 0, 254]);
+                }
+                preview[..lamps].fill(c);
+                label = format!("цвет {}", crate::config::hex(c));
+                vec![Cmd::SectionLed(segs)]
+            }
+            Applied::Effect(i) => {
+                label = format!("эффект ленты №{}", i + 1);
+                let mut v = vec![Cmd::LedEffect { group: device::EFFECT_DYNAMIC, index: i }];
+                v.extend(param.map(Cmd::DynamicSpeed));
+                v
+            }
+            Applied::RhythmDevice(i) => {
+                label = format!("музыка №{} (микрофон ленты)", i + 1);
+                let mut v: Vec<Cmd> = param.map(Cmd::SoundSensitivity).into_iter().collect();
+                v.push(Cmd::LedEffect { group: device::EFFECT_RHYTHM, index: i });
+                v
+            }
+            Applied::RhythmComputer(i) => {
+                label = format!("музыка №{} (звук компьютера)", i + 1);
+                Vec::new()
+            }
+        };
+        logger::info(format!("режим: {label}"));
+        self.shared.status.lock().unwrap().mode_label = Some(label);
+        if let Some(o) = self.out.as_ref() {
+            for c in cmds {
+                o.command(c);
+            }
+        }
+        self.preview = preview[..lamps].to_vec();
+        self.publish(|b| {
+            b.leds = preview;
+            b.led_count = lamps as u16;
+            b.fps = 0.0;
+            b.sends = 0.0;
+            b.grab_ms = 0.0;
+            b.latency_ms = 0.0;
+            b.hid_ms = 0.0;
+            b.audio_level = 0;
+            b.frame = b.frame.wrapping_add(1);
+        });
     }
 
     fn set_state(&mut self, state: State) {
@@ -396,6 +573,14 @@ impl Engine {
         }
     }
 
+    /// The strip state is unknown (new connection, lights turned off, SyncLight took over):
+    /// mode, speed and brightness will be sent again.
+    fn forget_sent(&mut self) {
+        self.mode_sent = None;
+        self.param_sent = None;
+        self.brightness_sent = None;
+    }
+
     fn log_error_once(&mut self, msg: String) {
         if msg != self.last_error {
             logger::info(&msg);
@@ -414,8 +599,10 @@ impl Engine {
             self.cap = None;
         }
         self.pipe = pipeline(&new);
+        let mode = mode_code(new.mode);
         self.settings = new;
         self.idle = false; // re-evaluate colours right away
+        self.publish(|b| b.mode = mode);
     }
 
     /// True while SyncLight.exe is running (checked every 3 s).
@@ -428,6 +615,7 @@ impl Engine {
                 // SyncLight drives the strip now: close our handle without touching the lights.
                 self.out = None;
                 self.lights_on = false;
+                self.forget_sent();
                 self.cap = None;
             }
             self.guard_hit = hit;
@@ -487,6 +675,7 @@ impl Engine {
         self.info = Some(info);
         self.out = Some(Sender::start(dev));
         self.lights_on = false;
+        self.forget_sent();
         true
     }
 
@@ -602,6 +791,7 @@ impl Engine {
         }
         self.lights_on = false;
         self.last_sent.clear();
+        self.forget_sent();
     }
 
     fn tick(&mut self) {
@@ -763,6 +953,7 @@ impl Engine {
             out.hid_max_ms = ms(ss.time_max);
             out.replaced = ss.replaced;
             out.preview = preview;
+            out.mode_label = None;
         }
         let (fps, sends) = (cs.frames as f32 / s, if self.out.is_some() { ss.sent as f32 } else { st.posted as f32 } / s);
         let (grab, lat, hid) = (per(cs.busy, cs.calls), per(cs.latency, cs.frames), per(ss.time, ss.sent));

@@ -16,7 +16,7 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use crate::config::{self, Settings};
+use crate::config::{self, Mode, RhythmSource, Settings};
 use crate::ipc::{self, StatusBlock, StatusReader};
 use crate::{autostart, icon};
 
@@ -189,6 +189,9 @@ impl SettingsApp {
                 }
                 s
             }
+            Some(b) if self.connected() && b.state == ipc::state::PAUSED => {
+                "Лентой управляет оригинальный SyncLight — закройте его, и подсветка продолжит работу".into()
+            }
             Some(_) if self.connected() => "Лента не найдена — проверьте USB-кабель".into(),
             _ => "Фоновая служба не запущена".into(),
         }
@@ -233,22 +236,45 @@ impl SettingsApp {
         });
     }
 
+    /// Mode the engine is actually running, or the selected one while offline.
+    fn active_mode(&self) -> Mode {
+        match self.status.as_ref().filter(|_| self.connected()).map(|b| b.mode) {
+            Some(1) => Mode::Static,
+            Some(2) => Mode::Effect,
+            Some(3) => Mode::Rhythm,
+            Some(_) => Mode::Sync,
+            None => self.settings.mode,
+        }
+    }
+
+    fn audio_level(&self) -> u8 {
+        self.status.as_ref().filter(|_| self.connected()).map(|b| b.audio_level).unwrap_or(0)
+    }
+
     fn preview_card(&mut self, ui: &mut Ui) {
         let connected = self.connected();
+        let mode = self.active_mode();
+        let computer = self.settings.rhythm_source == RhythmSource::Computer;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 section_title(ui, "Лента сейчас");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let zones = match self.status.as_ref() {
-                        Some(b) if connected && b.zones > 0 => format!("{} зон · {} светодиодов", b.zones, b.led_count),
+                    let info = match self.status.as_ref() {
+                        Some(b) if connected => match mode {
+                            Mode::Sync if b.zones > 0 => format!("{} зон · {} светодиодов", b.zones, b.led_count),
+                            Mode::Static => format!("цвет {}", config::hex(self.settings.color)),
+                            Mode::Effect => format!("эффект №{}", self.settings.effect + 1),
+                            Mode::Rhythm => format!("музыка №{}", self.settings.rhythm + 1),
+                            _ => String::new(),
+                        },
                         _ => String::new(),
                     };
-                    ui.label(RichText::new(zones).size(12.5).color(MUTED));
+                    ui.label(RichText::new(info).size(12.5).color(MUTED));
                 });
             });
             let h = (ui.available_width() * 0.62).clamp(250.0, 400.0);
             let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), h), Sense::hover());
-            self.paint_preview(&painter, resp.rect, resp.hover_pos());
+            self.paint_preview(&painter, resp.rect, resp.hover_pos(), mode);
             if !connected {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Фоновая служба не запущена — подсветка сейчас не работает.").color(AMBER));
@@ -257,23 +283,24 @@ impl SettingsApp {
                     }
                 });
             } else {
-                hint(ui, "Наведите на светодиод, чтобы увидеть его номер и цвет.");
+                hint(
+                    ui,
+                    match mode {
+                        Mode::Sync | Mode::Static => "Наведите на светодиод, чтобы увидеть его номер и цвет.",
+                        Mode::Effect => "Эффект анимирует сама лента, поэтому здесь он не показывается.",
+                        Mode::Rhythm if computer => "Лента реагирует на звук компьютера; точки показывают громкость.",
+                        Mode::Rhythm => "Лента слушает свой микрофон, поэтому здесь эффект не показывается.",
+                    },
+                );
             }
         });
     }
 
-    fn paint_preview(&self, p: &egui::Painter, area: Rect, hover: Option<Pos2>) {
+    fn paint_preview(&self, p: &egui::Painter, area: Rect, hover: Option<Pos2>, mode: Mode) {
         let live = self.status.as_ref().filter(|_| self.connected());
         let (h, v, edges, reverse) = match live {
             Some(b) if b.horizontal > 0 && b.vertical > 0 => (b.horizontal as usize, b.vertical as usize, b.edges, b.reverse == 1),
             _ => (31, 17, self.settings.edges, self.settings.reverse),
-        };
-        // A lit LED is bright even at a low value (40/255 visibly glows on the wall),
-        // while the same value on a monitor looks black: lift dark values for display.
-        let show = |x: u8| ((x as f32 / 255.0).powf(0.55) * 255.0).round() as u8;
-        let color_of = |i: usize| -> Option<Color32> {
-            let c = live?.leds.get(i)?;
-            (c.iter().any(|&x| x > 0)).then(|| Color32::from_rgb(show(c[0]), show(c[1]), show(c[2])))
         };
 
         // Monitor geometry (16:9), with room for LEDs and the stand.
@@ -283,16 +310,39 @@ impl SettingsApp {
         let mh = mw * 9.0 / 16.0;
         let mon = Rect::from_min_size(pos2(area.center().x - mw / 2.0, area.top() + margin), vec2(mw, mh));
         let pos = led_positions(mon, h, v, edges, reverse, 13.0);
+        let computer = self.settings.rhythm_source == RhythmSource::Computer;
+
+        // Colour of every LED: what the strip shows (sync, static), or the sound level (computer rhythm).
+        let raw: Vec<[u8; 3]> = (0..pos.len())
+            .map(|i| match mode {
+                Mode::Rhythm if computer => {
+                    let lit = (self.audio_level() as f32 / 100.0 * pos.len() as f32).round() as usize;
+                    if i < lit {
+                        let c = lerp_color(ACCENT, Color32::from_rgb(0xff, 0x4d, 0xb8), i as f32 / pos.len() as f32);
+                        [c.r(), c.g(), c.b()]
+                    } else {
+                        [0, 0, 0]
+                    }
+                }
+                Mode::Sync | Mode::Static => live.and_then(|b| b.leds.get(i).copied()).unwrap_or([0, 0, 0]),
+                _ => [0, 0, 0],
+            })
+            .collect();
+        // A lit LED is bright even at a low value (40/255 visibly glows on the wall),
+        // while the same value on a monitor looks black: lift dark values for display.
+        let show = |x: u8| ((x as f32 / 255.0).powf(0.55) * 255.0).round() as u8;
+        let colors: Vec<Option<Color32>> = raw
+            .iter()
+            .map(|c| (c.iter().any(|&x| x > 0)).then(|| Color32::from_rgb(show(c[0]), show(c[1]), show(c[2]))))
+            .collect();
 
         // Average colour: soft light on the "wall" and a hint of it on the screen.
         let (mut sum, mut lit) = ([0u32; 3], 0u32);
-        for i in 0..pos.len() {
-            if let Some(c) = color_of(i) {
-                sum[0] += c.r() as u32;
-                sum[1] += c.g() as u32;
-                sum[2] += c.b() as u32;
-                lit += 1;
-            }
+        for c in colors.iter().flatten() {
+            sum[0] += c.r() as u32;
+            sum[1] += c.g() as u32;
+            sum[2] += c.b() as u32;
+            lit += 1;
         }
         let avg = if lit > 0 {
             Color32::from_rgb((sum[0] / lit) as u8, (sum[1] / lit) as u8, (sum[2] / lit) as u8)
@@ -328,19 +378,31 @@ impl SettingsApp {
             p.rect_filled(screen, CornerRadius::same(4), avg.gamma_multiply(0.12));
         }
 
+        // What runs on the strip, for modes the preview can't draw.
+        let caption = match mode {
+            Mode::Effect => Some((format!("Эффект №{}", self.settings.effect + 1), "анимацию рисует сама лента".to_string())),
+            Mode::Rhythm if computer => Some((format!("{}%", self.audio_level()), format!("громкость · музыка №{}", self.settings.rhythm + 1))),
+            Mode::Rhythm => Some((format!("Музыка №{}", self.settings.rhythm + 1), "слушает микрофон ленты".to_string())),
+            _ => None,
+        };
+        if let Some((big, small)) = caption.filter(|_| live.is_some()) {
+            p.text(screen.center() - vec2(0.0, 10.0), Align2::CENTER_CENTER, big, FontId::new(30.0, semibold()), TEXT);
+            p.text(screen.center() + vec2(0.0, 20.0), Align2::CENTER_CENTER, small, FontId::proportional(14.0), MUTED);
+        }
+
         // LEDs: glow first, then the dots on top.
         let spacing = (mw / h.max(1) as f32).min(mh / v.max(1) as f32);
         let r = (spacing * 0.30).clamp(2.0, 6.0);
-        for (i, at) in pos.iter().enumerate() {
-            if let Some(c) = color_of(i) {
+        for (at, c) in pos.iter().zip(&colors) {
+            if let Some(c) = c {
                 p.circle_filled(*at, r * 3.6, c.gamma_multiply(0.06));
                 p.circle_filled(*at, r * 2.2, c.gamma_multiply(0.16));
             }
         }
-        for (i, at) in pos.iter().enumerate() {
-            match color_of(i) {
+        for (at, c) in pos.iter().zip(&colors) {
+            match c {
                 Some(c) => {
-                    p.circle_filled(*at, r, c);
+                    p.circle_filled(*at, r, *c);
                 }
                 None => {
                     p.circle_filled(*at, r * 0.8, LED_OFF);
@@ -363,7 +425,7 @@ impl SettingsApp {
                 .min_by(|a, b| a.2.total_cmp(&b.2));
             if let Some((i, at, _)) = near {
                 p.circle_stroke(at, r + 3.0, Stroke::new(1.5_f32, Color32::WHITE));
-                let c = live.and_then(|b| b.leds.get(i).copied()).unwrap_or([0, 0, 0]);
+                let c = raw.get(i).copied().unwrap_or([0, 0, 0]);
                 let text = if c == [0, 0, 0] {
                     format!("Светодиод №{} · выключен", i + 1)
                 } else {
@@ -387,14 +449,39 @@ impl SettingsApp {
     }
 
     fn stats_row(&self, ui: &mut Ui) {
+        let mode = self.active_mode();
         let live = self.status.as_ref().filter(|b| self.connected() && b.state == ipc::state::RUNNING);
-        let val = |f: fn(&StatusBlock) -> String| live.map(|b| f(b)).unwrap_or_else(|| "—".into());
-        let tiles = [
-            ("Экран", val(|b| format!("{:.0} к/с", b.fps))),
-            ("Лента", val(|b| format!("{:.0} к/с", b.sends))),
-            ("USB", val(|b| format!("{:.1} мс", b.hid_ms))),
-            ("Видеокарта", val(|b| format!("{:.1} мс", b.latency_ms))),
-        ];
+        let val = |f: &dyn Fn(&StatusBlock) -> String| live.map(|b| f(b)).unwrap_or_else(|| "—".into());
+        let s = &self.settings;
+        let tiles: [(&str, String); 4] = match mode {
+            Mode::Sync => [
+                ("Экран", val(&|b| format!("{:.0} к/с", b.fps))),
+                ("Лента", val(&|b| format!("{:.0} к/с", b.sends))),
+                ("USB", val(&|b| format!("{:.1} мс", b.hid_ms))),
+                ("Видеокарта", val(&|b| format!("{:.1} мс", b.latency_ms))),
+            ],
+            Mode::Static => [
+                ("Режим", "Цвет".into()),
+                ("Цвет", config::hex(s.color)),
+                ("Яркость ленты", format!("{}%", s.strip_brightness)),
+                ("Захват экрана", "выкл.".into()),
+            ],
+            Mode::Effect => [
+                ("Режим", "Эффект".into()),
+                ("Эффект", format!("№{}", s.effect + 1)),
+                ("Скорость", format!("{}%", s.effect_speed)),
+                ("Яркость ленты", format!("{}%", s.strip_brightness)),
+            ],
+            Mode::Rhythm => [
+                ("Режим", "Музыка".into()),
+                ("Эффект", format!("№{}", s.rhythm + 1)),
+                ("Источник", if s.rhythm_source == RhythmSource::Computer { "ПК".into() } else { "микрофон".into() }),
+                (
+                    "Громкость",
+                    if s.rhythm_source == RhythmSource::Computer { val(&|b| format!("{}%", b.audio_level)) } else { "—".into() },
+                ),
+            ],
+        };
         ui.columns(4, |cols| {
             for (col, (label, value)) in cols.iter_mut().zip(tiles) {
                 egui::Frame::new()
@@ -415,70 +502,180 @@ impl SettingsApp {
 
     fn settings_panel(&mut self, ui: &mut Ui) {
         let connected = self.connected();
+        let level = self.audio_level();
         let s = &mut self.settings;
         let mut changed = false;
 
-        card(ui, |ui| {
-            section_title(ui, "Зоны экрана");
-            let mut sel = s.per_led as usize;
-            if segmented(ui, "zones", &mut sel, &["Сетка 16×9", "Каждый светодиод"]) {
-                s.per_led = sel == 1;
-                changed = true;
+        if mode_tiles(ui, &mut s.mode, s.color) {
+            changed = true;
+        }
+        ui.add_space(12.0);
+
+        match s.mode {
+            Mode::Sync => {
+                card(ui, |ui| {
+                    section_title(ui, "Зоны экрана");
+                    let mut sel = s.per_led as usize;
+                    if segmented(ui, "zones", &mut sel, &["Сетка 16×9", "Каждый светодиод"]) {
+                        s.per_led = sel == 1;
+                        changed = true;
+                    }
+                    hint(
+                        ui,
+                        if s.per_led {
+                            "Своя зона у каждого светодиода: самая подробная картинка, вдвое больше данных по USB."
+                        } else {
+                            "Как в оригинальном SyncLight: 34 зоны по 1–2 светодиода."
+                        },
+                    );
+                });
+                ui.add_space(12.0);
+
+                card(ui, |ui| {
+                    section_title(ui, "Изображение");
+                    ui.label(RichText::new("Режим синхронизации").size(15.0).color(TEXT));
+                    let mut preset = if s.smooth_ms <= 40.0 {
+                        0
+                    } else if s.smooth_ms >= 100.0 {
+                        1
+                    } else {
+                        usize::MAX
+                    };
+                    if segmented(ui, "preset", &mut preset, &["Игры", "Фильмы"]) {
+                        s.smooth_ms = if preset == 0 { 20.0 } else { 150.0 };
+                        changed = true;
+                    }
+                    hint(ui, "Игры — мгновенная реакция, Фильмы — мягкие переходы (как Game/Movie mode в SyncLight).");
+                    ui.add_space(4.0);
+                    let mut pct = s.gain * 100.0;
+                    if slider_row(ui, "Яркость", format!("{pct:.0}%"), &mut pct, 50.0..=200.0, ("тусклее", "ярче")) {
+                        s.gain = (pct / 5.0).round() * 5.0 / 100.0;
+                        changed = true;
+                    }
+                    ui.add_space(4.0);
+                    let mut sm = s.smooth_ms;
+                    if slider_row(ui, "Плавность", format!("{sm:.0} мс"), &mut sm, 0.0..=300.0, ("мгновенно", "плавно")) {
+                        s.smooth_ms = (sm / 5.0).round() * 5.0;
+                        changed = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Частота обновления, кадров/с").size(15.0).color(TEXT));
+                    let mut idx = FPS_CHOICES.iter().position(|f| *f == s.fps).unwrap_or(usize::MAX);
+                    if segmented(ui, "fps", &mut idx, &["30", "60", "120", "144"]) {
+                        s.fps = FPS_CHOICES[idx];
+                        changed = true;
+                    }
+                    ui.add_space(6.0);
+                    if switch_row(ui, "Насыщенные цвета", "Почти чистые цвета становятся полностью чистыми, как в SyncLight.", &mut s.vivid) {
+                        changed = true;
+                    }
+                });
+                ui.add_space(12.0);
+
+                card(ui, |ui| {
+                    section_title(ui, "Установка ленты");
+                    ui.label(RichText::new("Где начинается лента").size(15.0).color(TEXT));
+                    let mut dir = s.reverse as usize;
+                    if segmented(ui, "dir", &mut dir, &["Снизу слева", "Снизу справа"]) {
+                        s.reverse = dir == 1;
+                        changed = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Сколько сторон занимает").size(15.0).color(TEXT));
+                    let mut e = (s.edges == 4) as usize;
+                    if segmented(ui, "edges", &mut e, &["3 стороны", "4 стороны"]) {
+                        s.edges = if e == 1 { 4 } else { 3 };
+                        changed = true;
+                    }
+                    hint(ui, "Проверка: цвета в предпросмотре слева должны совпадать с краями экрана.");
+                });
             }
-            hint(
-                ui,
-                if s.per_led {
-                    "Своя зона у каждого светодиода: самая подробная картинка, вдвое больше данных по USB."
-                } else {
-                    "Как в оригинальном SyncLight: 34 зоны по 1–2 светодиода."
-                },
-            );
-        });
+            Mode::Static => {
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        section_title(ui, "Цвет");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(config::hex(s.color)).family(semibold()).size(14.0).color(ACCENT_SOFT));
+                            let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                            ui.painter().circle_filled(r.center(), 10.0, Color32::from_rgb(s.color[0], s.color[1], s.color[2]));
+                            ui.painter().circle_stroke(r.center(), 10.0, Stroke::new(1.0_f32, BORDER));
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let mut hue = hue_of(s.color);
+                    if hue_bar(ui, &mut hue) {
+                        s.color = hsv(hue, 1.0, 1.0);
+                        changed = true;
+                    }
+                    ui.add_space(8.0);
+                    if let Some(c) = swatches(ui, s.color) {
+                        s.color = c;
+                        changed = true;
+                    }
+                    hint(ui, "Сумма каналов ограничивается, как в SyncLight: лента питается от USB, поэтому белый светит мягче чистых цветов.");
+                });
+            }
+            Mode::Effect => {
+                card(ui, |ui| {
+                    section_title(ui, "Эффект ленты");
+                    hint(ui, "Встроенные анимации прошивки — те же 7, что в разделе Dynamic у SyncLight.");
+                    ui.add_space(4.0);
+                    if effect_grid(ui, "effects", &mut s.effect) {
+                        changed = true;
+                    }
+                    ui.add_space(8.0);
+                    let mut sp = s.effect_speed as f32;
+                    if slider_row(ui, "Скорость", format!("{sp:.0}%"), &mut sp, 0.0..=100.0, ("медленно", "быстро")) {
+                        s.effect_speed = sp.round() as u8;
+                        changed = true;
+                    }
+                });
+            }
+            Mode::Rhythm => {
+                card(ui, |ui| {
+                    section_title(ui, "Под музыку");
+                    ui.label(RichText::new("Источник звука").size(15.0).color(TEXT));
+                    let mut src = (s.rhythm_source == RhythmSource::Device) as usize;
+                    if segmented(ui, "src", &mut src, &["Звук компьютера", "Микрофон ленты"]) {
+                        s.rhythm_source = if src == 1 { RhythmSource::Device } else { RhythmSource::Computer };
+                        changed = true;
+                    }
+                    hint(
+                        ui,
+                        if s.rhythm_source == RhythmSource::Computer {
+                            "Громкость берётся из индикатора Windows и отправляется на ленту 25 раз в секунду."
+                        } else {
+                            "Лента сама слушает музыку своим микрофоном."
+                        },
+                    );
+                    ui.add_space(6.0);
+                    if effect_grid(ui, "rhythms", &mut s.rhythm) {
+                        changed = true;
+                    }
+                    ui.add_space(8.0);
+                    let mut sens = s.rhythm_sensitivity as f32;
+                    if slider_row(ui, "Чувствительность", format!("{sens:.0}%"), &mut sens, 0.0..=100.0, ("тише", "громче")) {
+                        s.rhythm_sensitivity = sens.round() as u8;
+                        changed = true;
+                    }
+                    if s.rhythm_source == RhythmSource::Computer {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Уровень звука").size(15.0).color(TEXT));
+                        level_meter(ui, if connected { level } else { 0 });
+                    }
+                });
+            }
+        }
         ui.add_space(12.0);
 
         card(ui, |ui| {
-            section_title(ui, "Изображение");
-            let mut pct = s.gain * 100.0;
-            if slider_row(ui, "Яркость", format!("{pct:.0}%"), &mut pct, 50.0..=200.0, ("тусклее", "ярче")) {
-                s.gain = (pct / 5.0).round() * 5.0 / 100.0;
+            section_title(ui, "Лента");
+            let mut b = s.strip_brightness as f32;
+            if slider_row(ui, "Яркость ленты", format!("{b:.0}%"), &mut b, 2.0..=100.0, ("тусклее", "ярче")) {
+                s.strip_brightness = b.round() as u8;
                 changed = true;
             }
-            ui.add_space(4.0);
-            let mut sm = s.smooth_ms;
-            if slider_row(ui, "Плавность", format!("{sm:.0} мс"), &mut sm, 0.0..=300.0, ("мгновенно", "плавно")) {
-                s.smooth_ms = (sm / 5.0).round() * 5.0;
-                changed = true;
-            }
-            ui.add_space(4.0);
-            ui.label(RichText::new("Частота обновления, кадров/с").size(15.0).color(TEXT));
-            let mut idx = FPS_CHOICES.iter().position(|f| *f == s.fps).unwrap_or(usize::MAX);
-            if segmented(ui, "fps", &mut idx, &["30", "60", "120", "144"]) {
-                s.fps = FPS_CHOICES[idx];
-                changed = true;
-            }
-            ui.add_space(6.0);
-            if switch_row(ui, "Насыщенные цвета", "Почти чистые цвета становятся полностью чистыми, как в SyncLight.", &mut s.vivid) {
-                changed = true;
-            }
-        });
-        ui.add_space(12.0);
-
-        card(ui, |ui| {
-            section_title(ui, "Установка ленты");
-            ui.label(RichText::new("Где начинается лента").size(15.0).color(TEXT));
-            let mut dir = s.reverse as usize;
-            if segmented(ui, "dir", &mut dir, &["Снизу слева", "Снизу справа"]) {
-                s.reverse = dir == 1;
-                changed = true;
-            }
-            ui.add_space(4.0);
-            ui.label(RichText::new("Сколько сторон занимает").size(15.0).color(TEXT));
-            let mut e = (s.edges == 4) as usize;
-            if segmented(ui, "edges", &mut e, &["3 стороны", "4 стороны"]) {
-                s.edges = if e == 1 { 4 } else { 3 };
-                changed = true;
-            }
-            hint(ui, "Проверка: цвета в предпросмотре слева должны совпадать с краями экрана.");
+            hint(ui, "Яркость самой ленты (второй ползунок в SyncLight).");
         });
         ui.add_space(12.0);
 
@@ -781,4 +978,241 @@ fn setup_style(ctx: &egui::Context) {
         style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(14.0));
         style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(12.0));
     });
+}
+
+// ---------- mode widgets ----------
+
+/// Colour from hue (0..1), saturation and value.
+fn hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let f = |n: f32| {
+        let k = (n + h.rem_euclid(1.0) * 6.0) % 6.0;
+        v - v * s * (k.min(4.0 - k).clamp(0.0, 1.0))
+    };
+    [(f(5.0) * 255.0).round() as u8, (f(3.0) * 255.0).round() as u8, (f(1.0) * 255.0).round() as u8]
+}
+
+fn hsv32(h: f32, s: f32, v: f32) -> Color32 {
+    let c = hsv(h, s, v);
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
+fn hue_of(c: [u8; 3]) -> f32 {
+    let [r, g, b] = c.map(|x| x as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let d = max - r.min(g).min(b);
+    if d <= f32::EPSILON {
+        return 0.0;
+    }
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    h / 6.0
+}
+
+/// Four big tiles: screen / colour / effects / music.
+fn mode_tiles(ui: &mut Ui, mode: &mut Mode, color: [u8; 3]) -> bool {
+    let labels = ["Экран", "Цвет", "Эффекты", "Музыка"];
+    let gap = 8.0;
+    let w = (ui.available_width() - gap * 3.0) / 4.0;
+    let h = 76.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let p = ui.painter().clone();
+    let mut changed = false;
+    for (i, m) in Mode::ALL.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(rect.left() + i as f32 * (w + gap), rect.top()), vec2(w, h));
+        let resp = ui.interact(r, ui.id().with("mode").with(i), Sense::click());
+        if resp.clicked() && *mode != *m {
+            *mode = *m;
+            changed = true;
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let sel = *mode == *m;
+        let fill = if sel {
+            ACCENT.gamma_multiply(0.25)
+        } else if resp.hovered() {
+            CARD_HI
+        } else {
+            CARD
+        };
+        let stroke = if sel { Stroke::new(1.5_f32, ACCENT) } else { Stroke::new(1.0_f32, BORDER) };
+        p.rect(r, CornerRadius::same(14), fill, stroke, StrokeKind::Inside);
+        let col = if sel { Color32::WHITE } else { MUTED };
+        mode_icon(&p, *m, pos2(r.center().x, r.top() + 28.0), col, color);
+        p.text(pos2(r.center().x, r.bottom() - 16.0), Align2::CENTER_CENTER, labels[i], FontId::proportional(14.0), if sel { TEXT } else { MUTED });
+    }
+    changed
+}
+
+fn mode_icon(p: &egui::Painter, m: Mode, c: Pos2, col: Color32, color: [u8; 3]) {
+    let stroke = Stroke::new(2.0_f32, col);
+    match m {
+        Mode::Sync => {
+            p.rect_stroke(Rect::from_center_size(c - vec2(0.0, 2.0), vec2(28.0, 18.0)), CornerRadius::same(3), stroke, StrokeKind::Inside);
+            p.line_segment([pos2(c.x - 6.0, c.y + 11.0), pos2(c.x + 6.0, c.y + 11.0)], stroke);
+            for (k, h) in [0.0f32, 0.3, 0.6].iter().enumerate() {
+                p.circle_filled(pos2(c.x - 8.0 + k as f32 * 8.0, c.y - 15.0), 2.2, hsv32(*h, 0.7, 1.0));
+            }
+        }
+        Mode::Static => {
+            p.circle_filled(c, 11.0, Color32::from_rgb(color[0], color[1], color[2]));
+            p.circle_stroke(c, 11.0, Stroke::new(1.5_f32, col));
+        }
+        Mode::Effect => {
+            for k in 0..6 {
+                let a = k as f32 / 6.0 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                p.circle_filled(c + vec2(a.cos(), a.sin()) * 9.0, 3.2, hsv32(k as f32 / 6.0, 0.75, 1.0));
+            }
+        }
+        Mode::Rhythm => {
+            for (k, hgt) in [8.0f32, 18.0, 12.0, 22.0, 10.0].iter().enumerate() {
+                let x = c.x - 12.0 + k as f32 * 6.0;
+                p.line_segment([pos2(x, c.y + 11.0), pos2(x, c.y + 11.0 - hgt)], Stroke::new(3.0_f32, col));
+            }
+        }
+    }
+}
+
+/// Seven round buttons for the firmware effects.
+fn effect_grid(ui: &mut Ui, id: &str, selected: &mut u8) -> bool {
+    let n = config::EFFECTS as usize;
+    let d = 44.0;
+    let gap = 8.0;
+    let per_row = (((ui.available_width() + gap) / (d + gap)).floor() as usize).clamp(1, n);
+    let rows = n.div_ceil(per_row);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), rows as f32 * (d + gap) - gap), Sense::hover());
+    let p = ui.painter().clone();
+    let mut changed = false;
+    for i in 0..n {
+        let (row, col) = (i / per_row, i % per_row);
+        let c = pos2(rect.left() + col as f32 * (d + gap) + d / 2.0, rect.top() + row as f32 * (d + gap) + d / 2.0);
+        let r = Rect::from_center_size(c, vec2(d, d));
+        let resp = ui.interact(r, ui.id().with(id).with(i), Sense::click());
+        if resp.clicked() && *selected as usize != i {
+            *selected = i as u8;
+            changed = true;
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let sel = *selected as usize == i;
+        let tint = hsv32(i as f32 / n as f32, 0.6, 1.0);
+        let fill = if sel {
+            ACCENT
+        } else if resp.hovered() {
+            CARD_HI
+        } else {
+            BG
+        };
+        p.circle_filled(c, d / 2.0, fill);
+        p.circle_stroke(c, d / 2.0 - 1.5, Stroke::new(2.0_f32, if sel { Color32::WHITE } else { tint.gamma_multiply(0.75) }));
+        p.text(c, Align2::CENTER_CENTER, format!("{}", i + 1), FontId::new(19.0, semibold()), if sel { Color32::WHITE } else { TEXT });
+    }
+    changed
+}
+
+/// Rainbow bar; click or drag to pick a hue (0..1).
+fn hue_bar(ui: &mut Ui, hue: &mut f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click_and_drag());
+    let bar = rect.shrink2(vec2(12.0, 7.0));
+    let p = ui.painter();
+    let mut mesh = egui::Mesh::default();
+    let steps = 48u32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let x = bar.left() + t * bar.width();
+        let c = hsv32(t, 1.0, 1.0);
+        mesh.colored_vertex(pos2(x, bar.top()), c);
+        mesh.colored_vertex(pos2(x, bar.bottom()), c);
+        if i > 0 {
+            let b = 2 * (i - 1);
+            mesh.add_triangle(b, b + 1, b + 2);
+            mesh.add_triangle(b + 1, b + 2, b + 3);
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
+    p.circle_filled(pos2(bar.left(), bar.center().y), bar.height() / 2.0, hsv32(0.0, 1.0, 1.0));
+    p.circle_filled(pos2(bar.right(), bar.center().y), bar.height() / 2.0, hsv32(1.0, 1.0, 1.0));
+    let mut changed = false;
+    if resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let h = ((pos.x - bar.left()) / bar.width()).clamp(0.0, 0.999);
+            if (h - *hue).abs() > 0.001 {
+                *hue = h;
+                changed = true;
+            }
+        }
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let knob = pos2(bar.left() + *hue * bar.width(), bar.center().y);
+    p.circle(knob, 12.0, hsv32(*hue, 1.0, 1.0), Stroke::new(3.0_f32, Color32::WHITE));
+    changed
+}
+
+/// Quick colours; returns the clicked one.
+fn swatches(ui: &mut Ui, current: [u8; 3]) -> Option<[u8; 3]> {
+    const COLORS: [[u8; 3]; 10] = [
+        [0xff, 0xff, 0xff],
+        [0xff, 0xb4, 0x6b],
+        [0xff, 0x00, 0x00],
+        [0xff, 0x6a, 0x00],
+        [0xff, 0xd0, 0x00],
+        [0x00, 0xff, 0x40],
+        [0x00, 0xe5, 0xff],
+        [0x00, 0x40, 0xff],
+        [0x8a, 0x2b, 0xe2],
+        [0xff, 0x00, 0xf7],
+    ];
+    let d = 28.0;
+    let gap = 10.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), d + 4.0), Sense::hover());
+    let p = ui.painter().clone();
+    let mut picked = None;
+    for (i, c) in COLORS.iter().enumerate() {
+        let center = pos2(rect.left() + 2.0 + d / 2.0 + i as f32 * (d + gap), rect.center().y);
+        if center.x + d / 2.0 > rect.right() {
+            break;
+        }
+        let r = Rect::from_center_size(center, vec2(d, d));
+        let resp = ui.interact(r, ui.id().with("swatch").with(i), Sense::click());
+        if resp.clicked() {
+            picked = Some(*c);
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        p.circle_filled(center, d / 2.0, Color32::from_rgb(c[0], c[1], c[2]));
+        let ring = if *c == current {
+            Stroke::new(2.5_f32, Color32::WHITE)
+        } else if resp.hovered() {
+            Stroke::new(1.5_f32, MUTED)
+        } else {
+            Stroke::new(1.0_f32, BORDER)
+        };
+        p.circle_stroke(center, d / 2.0 + 2.0, ring);
+    }
+    picked
+}
+
+/// Segmented level meter, 0..=100.
+fn level_meter(ui: &mut Ui, level: u8) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+    let p = ui.painter();
+    let n = 28;
+    let gap = 3.0;
+    let w = (rect.width() - gap * (n - 1) as f32) / n as f32;
+    let lit = (level as f32 / 100.0 * n as f32).round() as usize;
+    for i in 0..n {
+        let r = Rect::from_min_size(pos2(rect.left() + i as f32 * (w + gap), rect.top()), vec2(w, rect.height()));
+        let t = i as f32 / (n - 1) as f32;
+        let on = lerp_color(GREEN, if t < 0.7 { AMBER } else { RED }, (t / 0.7).min(1.0));
+        p.rect_filled(r, CornerRadius::same(3), if i < lit { on } else { LED_OFF });
+    }
 }

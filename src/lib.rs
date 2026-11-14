@@ -1,5 +1,6 @@
 //! synclight-rs: screen-sync driver for Robobloq LED strips.
 
+pub mod audio;
 pub mod autostart;
 pub mod capture;
 pub mod color;
